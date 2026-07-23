@@ -121,15 +121,16 @@ export function createApp(options = {}) {
   }
 
   async function unlinkUuid(uuid) {
-    return store.withUuid(uuid, async (state, save) => {
+    return withTelegramBindingLock(() => store.withUuid(uuid, async (state, save) => {
       const previousLinkToken = state.linkToken;
       state.telegramChatId = null;
       state.tokenConsumedAt = null;
+      state.telegramLinkConfirmedAt = null;
       state.linkToken = await createUnusedLinkToken(previousLinkToken);
       markExistingAssistantEventsDelivered(state);
       await save();
       return publicLinkResponse(uuid, state);
-    });
+    }));
   }
 
   async function resetUuid(uuid) {
@@ -196,6 +197,9 @@ export function createApp(options = {}) {
 
   async function handleTelegramUpdate(update) {
     const message = update.message ?? update.edited_message;
+    if (!isPrivateTelegramChat(message?.chat)) {
+      return;
+    }
     const text = validateTelegramText(message?.text);
     const chatId = validateChatId(message?.chat?.id);
     if (!text || chatId === null) {
@@ -217,39 +221,60 @@ export function createApp(options = {}) {
       return;
     }
 
-    const bound = await withTelegramBindingLock(async () => {
+    await withTelegramBindingLock(async () => {
       const uuid = await store.findUuidByToken(safeToken);
       if (!uuid) {
-        return false;
+        return;
       }
 
       const chatOwnerUuid = await store.findUuidByChatId(chatId);
       if (chatOwnerUuid && chatOwnerUuid !== uuid) {
-        return false;
+        return;
       }
 
-      return store.withUuid(uuid, async (state, save) => {
-        if (state.linkToken !== safeToken || state.tokenConsumedAt || state.telegramChatId !== null) {
-          return false;
+      await store.withUuid(uuid, async (state, save) => {
+        const isFreshBind = state.linkToken === safeToken && !state.tokenConsumedAt && state.telegramChatId === null;
+        const needsConfirmationRetry = (
+          state.linkToken === safeToken &&
+          state.tokenConsumedAt &&
+          state.telegramChatId === chatId &&
+          !state.telegramLinkConfirmedAt
+        );
+        if (!isFreshBind && !needsConfirmationRetry) {
+          return;
         }
 
         const currentChatOwnerUuid = await store.findUuidByChatId(chatId);
         if (currentChatOwnerUuid && currentChatOwnerUuid !== uuid) {
-          return false;
+          return;
         }
 
-        state.telegramChatId = chatId;
-        state.tokenConsumedAt = new Date().toISOString();
-        await save();
-        return true;
+        if (isFreshBind) {
+          state.telegramChatId = chatId;
+          state.tokenConsumedAt = new Date().toISOString();
+          state.telegramLinkConfirmedAt = null;
+          await save();
+        }
+
+        if (await sendLinkConfirmation(chatId)) {
+          state.telegramLinkConfirmedAt = new Date().toISOString();
+          await save();
+        }
       });
     });
-    if (bound) {
-      try {
-        await telegram.sendText(chatId, TELEGRAM_LINK_CONFIRMATION);
-      } catch {
-        logger.warn('telegram link confirmation failed', { code: 'telegram_confirmation_failed' });
-      }
+  }
+
+  async function sendLinkConfirmation(chatId) {
+    if (!telegram.configured) {
+      logger.warn('telegram link confirmation failed', { code: 'telegram_confirmation_failed' });
+      return false;
+    }
+    try {
+      const result = await telegram.sendText(chatId, TELEGRAM_LINK_CONFIRMATION);
+      return result?.sent === true;
+    } catch {
+      logger.warn('telegram link confirmation failed', { code: 'telegram_confirmation_failed' });
+      return false;
     }
   }
 
@@ -322,6 +347,9 @@ export function createApp(options = {}) {
   }
 
   function withTelegramBindingLock(callback) {
+    if (typeof store.withGlobalLock === 'function') {
+      return store.withGlobalLock('telegram-binding', callback);
+    }
     const current = telegramBindingQueue
       .catch(() => undefined)
       .then(callback);
@@ -342,11 +370,12 @@ export function createApp(options = {}) {
   }
 
   function publicLinkResponse(uuid, state) {
+    const telegramReady = isTelegramReady();
     return {
       uuid,
-      telegramReady: isTelegramReady(),
+      telegramReady,
       telegramLinked: isTelegramLinked(state),
-      telegramLink: makeTelegramLink(botUsername, state.linkToken)
+      telegramLink: telegramReady && state.linkToken ? makeTelegramLink(botUsername, state.linkToken) : null
     };
   }
 
@@ -382,12 +411,16 @@ function parseStartToken(text) {
 
 function validateTelegramSecret(request, expectedSecret) {
   if (!expectedSecret) {
-    return;
+    throw new HttpError(401, 'unauthorized', 'telegram webhook token is invalid');
   }
   const received = request.headers['x-telegram-bot-api-secret-token'];
   if (received !== expectedSecret) {
     throw new HttpError(401, 'unauthorized', 'telegram webhook token is invalid');
   }
+}
+
+function isPrivateTelegramChat(chat) {
+  return Boolean(chat && chat.type === 'private');
 }
 
 function toPublicEvent(event) {
