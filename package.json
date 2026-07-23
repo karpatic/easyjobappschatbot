@@ -1,0 +1,20 @@
+{
+  "name": "easyjobappschatbot",
+  "version": "0.1.0",
+  "description": "A narrow relay between the Easy Job Apps Chrome extension and Telegram.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "telegram",
+    "chrome-extension",
+    "relay"
+  ],
+  "license": "UNLICENSED"
+}
