@@ -42,7 +42,7 @@ export function createApp(options = {}) {
       const path = url.pathname;
 
       if (request.method === 'GET' && path === '/health') {
-        sendJson(response, 200, { ok: true });
+        sendJson(response, 200, { ok: true, telegramReady: isTelegramReady() });
         return;
       }
 
@@ -82,26 +82,31 @@ export function createApp(options = {}) {
 
       throw new HttpError(404, 'not_found', 'route not found');
     } catch (error) {
-      const status = error?.status === 413 ? 413 : isHttpError(error) ? error.status : 500;
-      if (status >= 500) {
+      const httpError = isHttpError(error);
+      const status = error?.status === 413 ? 413 : httpError ? error.status : 500;
+      if (status >= 500 && !httpError) {
         logger.error('request failed', { code: 'internal_error' });
       }
       sendJson(response, status, {
         error: {
-          code: isHttpError(error) ? error.code : status === 413 ? 'payload_too_large' : 'internal_error',
-          message: isHttpError(error) ? error.message : status === 413 ? 'request body is too large' : 'internal server error'
+          code: httpError ? error.code : status === 413 ? 'payload_too_large' : 'internal_error',
+          message: httpError ? error.message : status === 413 ? 'request body is too large' : 'internal server error'
         }
       });
     }
   }
 
   async function linkUuid(uuid) {
+    if (!isTelegramReady()) {
+      throw new HttpError(503, 'telegram_unavailable', 'Telegram linking is unavailable');
+    }
+
     return store.withUuid(uuid, async (state, save) => {
       if (!state.linkToken) {
         state.linkToken = randomBytes(24).toString('base64url');
         await save();
       }
-      return publicLinkResponse(uuid, state.linkToken);
+      return publicLinkResponse(uuid, state);
     });
   }
 
@@ -157,6 +162,8 @@ export function createApp(options = {}) {
 
       return {
         uuid,
+        telegramReady: isTelegramReady(),
+        telegramLinked: isTelegramLinked(state),
         cursor: Math.max(0, state.nextSeq - 1),
         events: state.events
           .filter((event) => event.seq > after)
@@ -260,11 +267,21 @@ export function createApp(options = {}) {
     return changed;
   }
 
-  function publicLinkResponse(uuid, linkToken) {
+  function publicLinkResponse(uuid, state) {
     return {
       uuid,
-      telegramLink: makeTelegramLink(botUsername, linkToken)
+      telegramReady: isTelegramReady(),
+      telegramLinked: isTelegramLinked(state),
+      telegramLink: makeTelegramLink(botUsername, state.linkToken)
     };
+  }
+
+  function isTelegramReady() {
+    return Boolean(telegram.configured && telegramWebhookSecret);
+  }
+
+  function isTelegramLinked(state) {
+    return Boolean(state.tokenConsumedAt && state.telegramChatId !== null);
   }
 
   return {

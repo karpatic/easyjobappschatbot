@@ -17,7 +17,7 @@ test('health, no-store, and Chrome extension CORS headers are present', async (t
   const origin = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
   const health = await client.get('/health', { origin });
   assert.equal(health.status, 200);
-  assert.deepEqual(health.body, { ok: true });
+  assert.deepEqual(health.body, { ok: true, telegramReady: false });
   assert.equal(health.headers.get('cache-control'), 'no-store');
   assert.equal(health.headers.get('access-control-allow-origin'), origin);
   assert.match(health.headers.get('access-control-allow-methods'), /POST/);
@@ -27,20 +27,73 @@ test('health, no-store, and Chrome extension CORS headers are present', async (t
   assert.equal(options.headers.get('access-control-allow-origin'), origin);
 });
 
+test('health reports Telegram readiness only when bot token and webhook secret are configured', async (t) => {
+  const missingToken = await startApp(t, { telegramWebhookSecret: 'test-webhook-secret' });
+  t.after(missingToken.close);
+  assert.deepEqual((await missingToken.client.get('/health')).body, { ok: true, telegramReady: false });
+
+  const missingSecret = await startApp(t, { telegramBotToken: 'test-bot-token' });
+  t.after(missingSecret.close);
+  assert.deepEqual((await missingSecret.client.get('/health')).body, { ok: true, telegramReady: false });
+
+  const ready = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
+  t.after(ready.close);
+  assert.deepEqual((await ready.client.get('/health')).body, { ok: true, telegramReady: true });
+});
+
+test('POST /v1/link returns a safe unavailable error without creating a deep link when Telegram is not ready', async (t) => {
+  const missingBoth = await startApp(t);
+  t.after(missingBoth.close);
+  const missingBothResponse = await missingBoth.client.post('/v1/link', { uuid: UUID_A });
+  assert.equal(missingBothResponse.status, 503);
+  assert.equal(missingBothResponse.body.error.code, 'telegram_unavailable');
+  assert.equal(JSON.stringify(missingBothResponse.body).includes('telegramLink'), false);
+  assertNoSecretFields(missingBothResponse.body);
+  await assert.rejects(readFile(join(missingBoth.dataDir, `${UUID_A}.json`), 'utf8'), { code: 'ENOENT' });
+
+  const missingToken = await startApp(t, { telegramWebhookSecret: 'test-webhook-secret' });
+  t.after(missingToken.close);
+  const missingTokenResponse = await missingToken.client.post('/v1/link', { uuid: UUID_A });
+  assert.equal(missingTokenResponse.status, 503);
+  assert.equal(missingTokenResponse.body.error.code, 'telegram_unavailable');
+  assert.equal(JSON.stringify(missingTokenResponse.body).includes('telegramLink'), false);
+  assertNoSecretFields(missingTokenResponse.body, ['test-webhook-secret']);
+  await assert.rejects(readFile(join(missingToken.dataDir, `${UUID_A}.json`), 'utf8'), { code: 'ENOENT' });
+
+  const missingSecret = await startApp(t, { telegramBotToken: 'test-bot-token' });
+  t.after(missingSecret.close);
+  const missingSecretResponse = await missingSecret.client.post('/v1/link', { uuid: UUID_B });
+  assert.equal(missingSecretResponse.status, 503);
+  assert.equal(missingSecretResponse.body.error.code, 'telegram_unavailable');
+  assert.equal(JSON.stringify(missingSecretResponse.body).includes('telegramLink'), false);
+  assertNoSecretFields(missingSecretResponse.body, ['test-bot-token']);
+  await assert.rejects(readFile(join(missingSecret.dataDir, `${UUID_B}.json`), 'utf8'), { code: 'ENOENT' });
+});
+
 test('POST /v1/link creates a stable one-time Telegram deep link without exposing internals', async (t) => {
-  const { client, close } = await startApp(t);
+  const { client, close } = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
   t.after(close);
 
   const first = await client.post('/v1/link', { uuid: UUID_A });
   assert.equal(first.status, 200);
   assert.equal(first.body.uuid, UUID_A);
+  assert.equal(first.body.telegramReady, true);
+  assert.equal(first.body.telegramLinked, false);
   assert.match(first.body.telegramLink, /^https:\/\/t\.me\/EasyJobAppsBot\?start=[A-Za-z0-9_-]{32,}$/);
-  assertNoSecretFields(first.body);
+  assertNoSecretFields(first.body, ['test-bot-token', 'test-webhook-secret']);
 
   const second = await client.post('/v1/link', { uuid: UUID_A });
   assert.equal(second.status, 200);
   assert.equal(second.body.telegramLink, first.body.telegramLink);
-  assertNoSecretFields(second.body);
+  assert.equal(second.body.telegramReady, true);
+  assert.equal(second.body.telegramLinked, false);
+  assertNoSecretFields(second.body, ['test-bot-token', 'test-webhook-secret']);
 });
 
 test('Telegram webhook secret is enforced and /start tokens bind only once', async (t) => {
@@ -73,6 +126,11 @@ test('Telegram webhook secret is enforced and /start tokens bind only once', asy
   assert.equal(bound.status, 200);
   assert.deepEqual(bound.body, { ok: true });
 
+  const linked = await client.post('/v1/link', { uuid: UUID_A });
+  assert.equal(linked.status, 200);
+  assert.equal(linked.body.telegramLinked, true);
+  assertNoSecretFields(linked.body, ['test-webhook-secret', 'test-token']);
+
   const rebound = await client.post('/telegram/webhook', startUpdate(token, 999), {
     'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
   });
@@ -92,16 +150,26 @@ test('Telegram webhook secret is enforced and /start tokens bind only once', asy
 
 test('Telegram text after binding is appended as user events and survives reload', async (t) => {
   const dataDir = await tempDataDir(t);
-  const first = await startApp(t, { dataDir });
+  const first = await startApp(t, {
+    dataDir,
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
   const link = await first.client.post('/v1/link', { uuid: UUID_A });
   const token = startToken(link.body.telegramLink);
 
-  assert.equal((await first.client.post('/telegram/webhook', startUpdate(token, 456))).status, 200);
-  assert.equal((await first.client.post('/telegram/webhook', textUpdate('hello from telegram', 456, 11, 2))).status, 200);
+  assert.equal((await first.client.post('/telegram/webhook', startUpdate(token, 456), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await first.client.post('/telegram/webhook', textUpdate('hello from telegram', 456, 11, 2), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
 
   const beforeReload = await first.client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
   assert.equal(beforeReload.status, 200);
   assert.equal(beforeReload.body.cursor, 1);
+  assert.equal(beforeReload.body.telegramReady, true);
+  assert.equal(beforeReload.body.telegramLinked, true);
   assert.equal(beforeReload.body.events.length, 1);
   assert.equal(beforeReload.body.events[0].origin, 'telegram');
   assert.equal(beforeReload.body.events[0].role, 'user');
@@ -110,17 +178,54 @@ test('Telegram text after binding is appended as user events and survives reload
   assertNoSecretFields(beforeReload.body);
   await first.close();
 
-  const second = await startApp(t, { dataDir });
+  const second = await startApp(t, {
+    dataDir,
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
   t.after(second.close);
   const afterReload = await second.client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
   assert.equal(afterReload.status, 200);
+  assert.equal(afterReload.body.telegramReady, true);
+  assert.equal(afterReload.body.telegramLinked, true);
   assert.deepEqual(afterReload.body.events, beforeReload.body.events);
+});
+
+test('POST /v1/sync reports Telegram readiness and link state without exposing internals', async (t) => {
+  const unavailable = await startApp(t);
+  t.after(unavailable.close);
+  const notReady = await unavailable.client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(notReady.status, 200);
+  assert.equal(notReady.body.telegramReady, false);
+  assert.equal(notReady.body.telegramLinked, false);
+  assertNoSecretFields(notReady.body);
+
+  const ready = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
+  t.after(ready.close);
+  const unlinked = await ready.client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(unlinked.status, 200);
+  assert.equal(unlinked.body.telegramReady, true);
+  assert.equal(unlinked.body.telegramLinked, false);
+  assertNoSecretFields(unlinked.body, ['test-bot-token', 'test-webhook-secret']);
+
+  const link = await ready.client.post('/v1/link', { uuid: UUID_A });
+  await ready.client.post('/telegram/webhook', startUpdate(startToken(link.body.telegramLink), 234), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  });
+
+  const linked = await ready.client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(linked.status, 200);
+  assert.equal(linked.body.telegramReady, true);
+  assert.equal(linked.body.telegramLinked, true);
+  assertNoSecretFields(linked.body, ['test-bot-token', 'test-webhook-secret', '234']);
 });
 
 test('sync appends extension events once, deduplicates IDs, and honors cursors', async (t) => {
   const { client, close } = await startApp(t);
   t.after(close);
-  await client.post('/v1/link', { uuid: UUID_A });
 
   const first = await client.post('/v1/sync', {
     uuid: UUID_A,
@@ -159,7 +264,6 @@ test('sync appends extension events once, deduplicates IDs, and honors cursors',
 test('extension replyTo events round-trip through public sync responses and storage reloads', async (t) => {
   const dataDir = await tempDataDir(t);
   const first = await startApp(t, { dataDir });
-  await first.client.post('/v1/link', { uuid: UUID_A });
 
   const response = await first.client.post('/v1/sync', {
     uuid: UUID_A,
@@ -201,7 +305,6 @@ test('extension replyTo must use the safe event ID format', async (t) => {
 test('concurrent sync writes for the same UUID are serialized without losing events', async (t) => {
   const { client, close } = await startApp(t);
   t.after(close);
-  await client.post('/v1/link', { uuid: UUID_A });
 
   await Promise.all(Array.from({ length: 20 }, (_, index) => client.post('/v1/sync', {
     uuid: UUID_A,
@@ -217,7 +320,10 @@ test('concurrent sync writes for the same UUID are serialized without losing eve
 });
 
 test('reset clears events and preserves the UUID Telegram link', async (t) => {
-  const { client, close } = await startApp(t);
+  const { client, close } = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
   t.after(close);
 
   const link = await client.post('/v1/link', { uuid: UUID_A });
@@ -242,12 +348,15 @@ test('assistant events are delivered to Telegram via injected transport exactly 
   const sends = [];
   const { client, close } = await startApp(t, {
     telegramBotToken: 'fake-bot-token',
+    telegramWebhookSecret: 'fake-webhook-secret',
     telegramTransport: captureTelegram(sends)
   });
   t.after(close);
 
   const link = await client.post('/v1/link', { uuid: UUID_A });
-  assert.equal((await client.post('/telegram/webhook', startUpdate(startToken(link.body.telegramLink), 789))).status, 200);
+  assert.equal((await client.post('/telegram/webhook', startUpdate(startToken(link.body.telegramLink), 789), {
+    'X-Telegram-Bot-Api-Secret-Token': 'fake-webhook-secret'
+  })).status, 200);
 
   const first = await client.post('/v1/sync', {
     uuid: UUID_A,
@@ -324,7 +433,11 @@ test('secret and chat identifiers are not disclosed in responses or logs on deli
 
 test('state is stored in one JSON file per UUID with atomic-write cleanup', async (t) => {
   const dataDir = await tempDataDir(t);
-  const { client, close } = await startApp(t, { dataDir });
+  const { client, close } = await startApp(t, {
+    dataDir,
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
   t.after(close);
 
   await client.post('/v1/link', { uuid: UUID_A });
@@ -352,6 +465,7 @@ async function startApp(t, overrides = {}) {
   });
   return {
     client: makeClient(app.handler),
+    dataDir,
     async close() {
       await app.close?.();
     }

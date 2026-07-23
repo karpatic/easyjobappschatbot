@@ -8,7 +8,7 @@
 - **Durable per-UUID state:** each UUID v4 gets one JSON file at `${CHATBOT_DATA_DIR}/${uuid}.json`.
 - **Atomic persistence:** state writes go to a temporary file in the data directory, fsync the file, then rename over the UUID JSON file.
 - **Per-UUID serialization:** all mutations for a UUID run through an in-process promise queue to avoid lost updates under concurrent syncs.
-- **Private Telegram binding:** `/v1/link` returns a deep link for `EasyJobAppsBot`; the Telegram chat ID is stored only in the UUID state file and is never returned by the public API.
+- **Private Telegram binding:** `/v1/link` returns a deep link for `EasyJobAppsBot` only when Telegram is fully configured; the Telegram chat ID is stored only in the UUID state file and is never returned by the public API.
 - **No-store responses:** all responses include `Cache-Control: no-store`.
 - **Bounded JSON bodies:** request bodies default to `65536` bytes and can be lowered or raised with `CHATBOT_BODY_LIMIT_BYTES`.
 
@@ -21,12 +21,14 @@ All POST endpoints require `Content-Type: application/json`.
 Returns:
 
 ```json
-{ "ok": true }
+{ "ok": true, "telegramReady": true }
 ```
+
+`telegramReady` is `true` only when both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET` are configured.
 
 ### `POST /v1/link`
 
-Creates or returns the stable one-time Telegram deep link for a UUID v4.
+Creates or returns the stable one-time Telegram deep link for a UUID v4. The relay returns a deep link only when Telegram is ready.
 
 Request:
 
@@ -39,11 +41,27 @@ Response:
 ```json
 {
   "uuid": "11111111-1111-4111-8111-111111111111",
+  "telegramReady": true,
+  "telegramLinked": false,
   "telegramLink": "https://t.me/EasyJobAppsBot?start=<one-time-token>"
 }
 ```
 
 The token binds on the first Telegram `/start <token>` received by the webhook. Later attempts to reuse the same token do not rebind it.
+`telegramLinked` is `true` only after that token has been consumed and the relay has stored the Telegram chat binding. It is never based on link creation alone.
+
+If either `TELEGRAM_BOT_TOKEN` or `TELEGRAM_WEBHOOK_SECRET` is missing, the relay does not create or return a deep link:
+
+```json
+{
+  "error": {
+    "code": "telegram_unavailable",
+    "message": "Telegram linking is unavailable"
+  }
+}
+```
+
+The unavailable response uses HTTP `503`.
 
 ### `POST /v1/sync`
 
@@ -72,6 +90,8 @@ Response:
 ```json
 {
   "uuid": "11111111-1111-4111-8111-111111111111",
+  "telegramReady": true,
+  "telegramLinked": true,
   "cursor": 1,
   "events": [
     {
@@ -88,7 +108,7 @@ Response:
 }
 ```
 
-Duplicate event IDs are ignored, so retrying the same batch is safe. A linked UUID with `TELEGRAM_BOT_TOKEN` configured sends new extension-origin `assistant` text events to the bound Telegram chat.
+Duplicate event IDs are ignored, so retrying the same batch is safe. A linked UUID with Telegram ready sends new extension-origin `assistant` text events to the bound Telegram chat. `/v1/sync` exposes only `telegramReady` and `telegramLinked`; it never returns the Telegram chat ID, bot token, or webhook secret.
 
 Limits:
 
@@ -138,8 +158,8 @@ Create an untracked env file from `.env.example`, then either export its values 
 | --- | --- | --- | --- |
 | `CHATBOT_DATA_DIR` | Yes | none | Directory for per-UUID JSON state files. |
 | `TELEGRAM_BOT_USERNAME` | No | `EasyJobAppsBot` | Bot username used in generated deep links. |
-| `TELEGRAM_BOT_TOKEN` | No | none | Bot API token used only for outbound Telegram delivery. |
-| `TELEGRAM_WEBHOOK_SECRET` | No | none | Secret expected in Telegram webhook requests. |
+| `TELEGRAM_BOT_TOKEN` | Required for Telegram linking | none | Bot API token used only for outbound Telegram delivery. Deep links are unavailable without it. |
+| `TELEGRAM_WEBHOOK_SECRET` | Required for Telegram linking | none | Secret expected in Telegram webhook requests. Deep links are unavailable without it. |
 | `CHATBOT_ALLOWED_ORIGINS` | No | none | Comma-separated exact CORS origins. Chrome extension origins are allowed by pattern. |
 | `CHATBOT_BODY_LIMIT_BYTES` | No | `65536` | Maximum JSON request body size in bytes. |
 | `HOST` | No | `0.0.0.0` | Listen host. |
