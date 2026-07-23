@@ -9,12 +9,14 @@
 - **Atomic persistence:** state writes go to a temporary file in the data directory, fsync the file, then rename over the UUID JSON file.
 - **Per-UUID serialization:** all mutations for a UUID run through an in-process promise queue to avoid lost updates under concurrent syncs.
 - **Private Telegram binding:** `/v1/link` returns a deep link for `EasyJobAppsBot` only when Telegram is fully configured; the Telegram chat ID is stored only in the UUID state file and is never returned by the public API.
+- **Safe relinking:** `/v1/unlink` detaches the current Telegram chat, keeps conversation history, invalidates the old deep-link token, creates a fresh one-time token, and prevents older unsent assistant messages from being replayed to a future chat.
 - **No-store responses:** all responses include `Cache-Control: no-store`.
 - **Bounded JSON bodies:** request bodies default to `65536` bytes and can be lowered or raised with `CHATBOT_BODY_LIMIT_BYTES`.
 
 ## API
 
 All POST endpoints require `Content-Type: application/json`.
+The extension-facing POST endpoints use the validated UUID v4 in the JSON body as the existing bearer value. Treat UUIDs as private capability tokens.
 
 ### `GET /health`
 
@@ -62,6 +64,29 @@ If either `TELEGRAM_BOT_TOKEN` or `TELEGRAM_WEBHOOK_SECRET` is missing, the rela
 ```
 
 The unavailable response uses HTTP `503`.
+
+### `POST /v1/unlink`
+
+Detaches any currently bound Telegram chat for a UUID v4 and returns a fresh relink URL. Conversation events are preserved, but `telegramChatId` and `tokenConsumedAt` are cleared in storage. The previous deep-link token becomes invalid immediately.
+
+Request:
+
+```json
+{ "uuid": "11111111-1111-4111-8111-111111111111" }
+```
+
+Response:
+
+```json
+{
+  "uuid": "11111111-1111-4111-8111-111111111111",
+  "telegramReady": true,
+  "telegramLinked": false,
+  "telegramLink": "https://t.me/EasyJobAppsBot?start=<fresh-one-time-token>"
+}
+```
+
+After unlinking, messages from the old Telegram chat are ignored. A fresh `/start <fresh-one-time-token>` from another Telegram chat can bind the UUID again. Existing extension-origin assistant event IDs are marked delivered during unlink, so unsent assistant messages from before unlink are not replayed to the newly linked chat.
 
 ### `POST /v1/sync`
 
@@ -147,8 +172,16 @@ X-Telegram-Bot-Api-Secret-Token: <configured-secret>
 Supported update behavior:
 
 - `/start <token>` binds the one-time token to that Telegram chat if it has not already been consumed.
+- A Telegram chat ID that is already bound to one UUID cannot bind to a second UUID; the second `/start` is acknowledged but ignored, and that token can still be used from another unbound chat.
 - Later Telegram text from a bound chat is appended as an `origin: "telegram"`, `role: "user"` event.
 - Unknown chats, invalid tokens, non-text messages, and duplicate Telegram message IDs are acknowledged but ignored.
+
+## Security Notes
+
+- Do not log, return, or expose `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, Telegram chat IDs, or deep-link tokens outside the link URL returned to the caller.
+- Treat the UUID in extension API requests as a bearer value; send it only over HTTPS from trusted extension contexts.
+- `/v1/unlink` rotates the deep-link token on every call, including already-unlinked UUIDs. Use the latest returned `telegramLink`; older links must be considered revoked.
+- `/v1/reset` intentionally keeps its existing semantics: it clears conversation events while preserving the current Telegram link and binding.
 
 ## Configuration
 

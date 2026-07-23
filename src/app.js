@@ -27,6 +27,7 @@ export function createApp(options = {}) {
   const bodyLimitBytes = options.bodyLimitBytes || DEFAULT_BODY_LIMIT_BYTES;
   const telegramWebhookSecret = options.telegramWebhookSecret || null;
   const allowedOrigins = options.allowedOrigins || [];
+  let telegramBindingQueue = Promise.resolve();
 
   async function handler(request, response) {
     applyCommonHeaders(request, response, allowedOrigins);
@@ -50,6 +51,14 @@ export function createApp(options = {}) {
         const body = requireObject(await readJsonBody(request, bodyLimitBytes));
         const uuid = validateUuid(body.uuid);
         const result = await linkUuid(uuid);
+        sendJson(response, 200, result);
+        return;
+      }
+
+      if (request.method === 'POST' && path === '/v1/unlink') {
+        const body = requireObject(await readJsonBody(request, bodyLimitBytes));
+        const uuid = validateUuid(body.uuid);
+        const result = await unlinkUuid(uuid);
         sendJson(response, 200, result);
         return;
       }
@@ -103,9 +112,21 @@ export function createApp(options = {}) {
 
     return store.withUuid(uuid, async (state, save) => {
       if (!state.linkToken) {
-        state.linkToken = randomBytes(24).toString('base64url');
+        state.linkToken = await createUnusedLinkToken();
         await save();
       }
+      return publicLinkResponse(uuid, state);
+    });
+  }
+
+  async function unlinkUuid(uuid) {
+    return store.withUuid(uuid, async (state, save) => {
+      const previousLinkToken = state.linkToken;
+      state.telegramChatId = null;
+      state.tokenConsumedAt = null;
+      state.linkToken = await createUnusedLinkToken(previousLinkToken);
+      markExistingAssistantEventsDelivered(state);
+      await save();
       return publicLinkResponse(uuid, state);
     });
   }
@@ -113,7 +134,7 @@ export function createApp(options = {}) {
   async function resetUuid(uuid) {
     return store.withUuid(uuid, async (state, save) => {
       if (!state.linkToken) {
-        state.linkToken = randomBytes(24).toString('base64url');
+        state.linkToken = await createUnusedLinkToken();
       }
       state.events = [];
       state.nextSeq = 1;
@@ -194,18 +215,32 @@ export function createApp(options = {}) {
     if (!safeToken) {
       return;
     }
-    const uuid = await store.findUuidByToken(safeToken);
-    if (!uuid) {
-      return;
-    }
 
-    await store.withUuid(uuid, async (state, save) => {
-      if (state.linkToken !== safeToken || state.tokenConsumedAt || state.telegramChatId !== null) {
+    await withTelegramBindingLock(async () => {
+      const uuid = await store.findUuidByToken(safeToken);
+      if (!uuid) {
         return;
       }
-      state.telegramChatId = chatId;
-      state.tokenConsumedAt = new Date().toISOString();
-      await save();
+
+      const chatOwnerUuid = await store.findUuidByChatId(chatId);
+      if (chatOwnerUuid && chatOwnerUuid !== uuid) {
+        return;
+      }
+
+      await store.withUuid(uuid, async (state, save) => {
+        if (state.linkToken !== safeToken || state.tokenConsumedAt || state.telegramChatId !== null) {
+          return;
+        }
+
+        const currentChatOwnerUuid = await store.findUuidByChatId(chatId);
+        if (currentChatOwnerUuid && currentChatOwnerUuid !== uuid) {
+          return;
+        }
+
+        state.telegramChatId = chatId;
+        state.tokenConsumedAt = new Date().toISOString();
+        await save();
+      });
     });
   }
 
@@ -267,6 +302,36 @@ export function createApp(options = {}) {
     return changed;
   }
 
+  function markExistingAssistantEventsDelivered(state) {
+    const sent = new Set(state.outboundSentEventIds);
+    for (const event of state.events) {
+      if (event.origin === 'extension' && event.role === 'assistant') {
+        sent.add(event.id);
+      }
+    }
+    state.outboundSentEventIds = [...sent];
+  }
+
+  function withTelegramBindingLock(callback) {
+    const current = telegramBindingQueue
+      .catch(() => undefined)
+      .then(callback);
+    telegramBindingQueue = current.catch(() => undefined);
+    return current;
+  }
+
+  async function createUnusedLinkToken(previousToken = null) {
+    for (;;) {
+      const token = createLinkToken();
+      if (token === previousToken) {
+        continue;
+      }
+      if (!await store.findUuidByToken(token)) {
+        return token;
+      }
+    }
+  }
+
   function publicLinkResponse(uuid, state) {
     return {
       uuid,
@@ -288,6 +353,10 @@ export function createApp(options = {}) {
     handler,
     close: () => store.close?.()
   };
+}
+
+function createLinkToken() {
+  return randomBytes(24).toString('base64url');
 }
 
 export function makeTelegramLink(botUsername, token) {

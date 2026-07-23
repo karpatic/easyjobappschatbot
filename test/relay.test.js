@@ -191,6 +191,169 @@ test('Telegram text after binding is appended as user events and survives reload
   assert.deepEqual(afterReload.body.events, beforeReload.body.events);
 });
 
+test('POST /v1/unlink detaches the old chat, preserves history, rotates the token, and rejects the old token', async (t) => {
+  const dataDir = await tempDataDir(t);
+  const { client, close } = await startApp(t, {
+    dataDir,
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
+  t.after(close);
+
+  const link = await client.post('/v1/link', { uuid: UUID_A });
+  const oldToken = startToken(link.body.telegramLink);
+  assert.equal((await client.post('/telegram/webhook', startUpdate(oldToken, 456), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await client.post('/telegram/webhook', textUpdate('before unlink', 456, 11, 2), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  await client.post('/v1/sync', {
+    uuid: UUID_A,
+    after: 0,
+    events: [{ id: 'extension-before-unlink', role: 'user', type: 'text', text: 'history stays' }]
+  });
+
+  const unlink = await client.post('/v1/unlink', { uuid: UUID_A });
+  assert.equal(unlink.status, 200);
+  assert.equal(unlink.body.uuid, UUID_A);
+  assert.equal(unlink.body.telegramReady, true);
+  assert.equal(unlink.body.telegramLinked, false);
+  assert.match(unlink.body.telegramLink, /^https:\/\/t\.me\/EasyJobAppsBot\?start=[A-Za-z0-9_-]{32,}$/);
+  assert.notEqual(unlink.body.telegramLink, link.body.telegramLink);
+  assertNoSecretFields(unlink.body, ['test-bot-token', 'test-webhook-secret', '456']);
+
+  const unlinkedState = JSON.parse(await readFile(join(dataDir, `${UUID_A}.json`), 'utf8'));
+  assert.equal(unlinkedState.telegramChatId, null);
+  assert.equal(unlinkedState.tokenConsumedAt, null);
+  assert.equal(unlinkedState.linkToken, startToken(unlink.body.telegramLink));
+  assert.equal(unlinkedState.events.length, 2);
+  assert.deepEqual(unlinkedState.events.map((event) => event.text), ['before unlink', 'history stays']);
+
+  assert.equal((await client.post('/telegram/webhook', startUpdate(oldToken, 789), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await client.post('/telegram/webhook', textUpdate('old token must not bind', 789, 12, 3), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await client.post('/telegram/webhook', textUpdate('old chat must be detached', 456, 13, 4), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+
+  const afterOldChat = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(afterOldChat.status, 200);
+  assert.equal(afterOldChat.body.telegramLinked, false);
+  assert.deepEqual(afterOldChat.body.events.map((event) => event.text), ['before unlink', 'history stays']);
+
+  const newToken = startToken(unlink.body.telegramLink);
+  assert.equal((await client.post('/telegram/webhook', startUpdate(newToken, 789), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await client.post('/telegram/webhook', textUpdate('after relink', 789, 14, 5), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+
+  const afterRelink = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(afterRelink.status, 200);
+  assert.equal(afterRelink.body.telegramLinked, true);
+  assert.deepEqual(afterRelink.body.events.map((event) => event.text), ['before unlink', 'history stays', 'after relink']);
+});
+
+test('POST /v1/unlink marks existing assistant events delivered so a newly linked chat does not receive old unsent replies', async (t) => {
+  const sends = [];
+  let failDelivery = true;
+  const { client, close } = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret',
+    telegramTransport: async (request) => {
+      sends.push(request);
+      if (failDelivery) {
+        throw new Error('temporary test delivery failure');
+      }
+      return { ok: true, result: { message_id: sends.length } };
+    },
+    logger: collectLogs().logger
+  });
+  t.after(close);
+
+  const link = await client.post('/v1/link', { uuid: UUID_A });
+  assert.equal((await client.post('/telegram/webhook', startUpdate(startToken(link.body.telegramLink), 321), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+
+  const failedDelivery = await client.post('/v1/sync', {
+    uuid: UUID_A,
+    after: 0,
+    events: [{ id: 'assistant-before-unlink', role: 'assistant', type: 'text', text: 'do not replay me' }]
+  });
+  assert.equal(failedDelivery.status, 200);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].body.chat_id, 321);
+  assert.equal(sends[0].body.text, 'do not replay me');
+
+  const unlink = await client.post('/v1/unlink', { uuid: UUID_A });
+  assert.equal(unlink.status, 200);
+  failDelivery = false;
+
+  assert.equal((await client.post('/telegram/webhook', startUpdate(startToken(unlink.body.telegramLink), 654), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+
+  const replayCheck = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(replayCheck.status, 200);
+  assert.equal(replayCheck.body.telegramLinked, true);
+  assert.equal(sends.length, 1);
+
+  const newAssistant = await client.post('/v1/sync', {
+    uuid: UUID_A,
+    after: 0,
+    events: [{ id: 'assistant-after-relink', role: 'assistant', type: 'text', text: 'send this one' }]
+  });
+  assert.equal(newAssistant.status, 200);
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].body.chat_id, 654);
+  assert.equal(sends[1].body.text, 'send this one');
+});
+
+test('Telegram /start refuses to bind one chat ID to two UUIDs without consuming the second token', async (t) => {
+  const { client, close } = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret'
+  });
+  t.after(close);
+
+  const linkA = await client.post('/v1/link', { uuid: UUID_A });
+  const linkB = await client.post('/v1/link', { uuid: UUID_B });
+  const tokenA = startToken(linkA.body.telegramLink);
+  const tokenB = startToken(linkB.body.telegramLink);
+
+  assert.equal((await client.post('/telegram/webhook', startUpdate(tokenA, 777), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  assert.equal((await client.post('/telegram/webhook', startUpdate(tokenB, 777), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+
+  const uuidAAfterDuplicate = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  const uuidBAfterDuplicate = await client.post('/v1/sync', { uuid: UUID_B, after: 0, events: [] });
+  assert.equal(uuidAAfterDuplicate.body.telegramLinked, true);
+  assert.equal(uuidBAfterDuplicate.body.telegramLinked, false);
+
+  assert.equal((await client.post('/telegram/webhook', textUpdate('still belongs to A', 777, 21, 6), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  const uuidAEvents = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  const uuidBEvents = await client.post('/v1/sync', { uuid: UUID_B, after: 0, events: [] });
+  assert.deepEqual(uuidAEvents.body.events.map((event) => event.text), ['still belongs to A']);
+  assert.deepEqual(uuidBEvents.body.events, []);
+
+  assert.equal((await client.post('/telegram/webhook', startUpdate(tokenB, 888), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  })).status, 200);
+  const uuidBAfterFreshChat = await client.post('/v1/sync', { uuid: UUID_B, after: 0, events: [] });
+  assert.equal(uuidBAfterFreshChat.body.telegramLinked, true);
+});
+
 test('POST /v1/sync reports Telegram readiness and link state without exposing internals', async (t) => {
   const unavailable = await startApp(t);
   t.after(unavailable.close);
@@ -388,6 +551,7 @@ test('validation rejects invalid UUIDs, cursors, event sizes, traversal, and ove
 
   assert.equal((await client.post('/v1/link', { uuid: 'not-a-uuid' })).status, 400);
   assert.equal((await client.post('/v1/link', { uuid: '../' + UUID_A })).status, 400);
+  assert.equal((await client.post('/v1/unlink', { uuid: 'not-a-uuid' })).status, 400);
   assert.equal((await client.post('/v1/sync', { uuid: UUID_A, after: -1, events: [] })).status, 400);
   assert.equal((await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [{ id: 'x', role: 'assistant', type: 'text', text: 'a'.repeat(4097) }] })).status, 400);
   assert.equal((await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: Array.from({ length: 51 }, (_, index) => ({ id: `event-${index}`, role: 'user', type: 'text', text: 'x' })) })).status, 400);
