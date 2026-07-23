@@ -125,6 +125,9 @@ test('Telegram webhook secret is enforced and /start tokens bind only once', asy
   });
   assert.equal(bound.status, 200);
   assert.deepEqual(bound.body, { ok: true });
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].body.chat_id, 123);
+  assert.equal(sends[0].body.text, 'Connected to Easy Job Apps. Messages are processed when the linked extension Chat is open.');
 
   const linked = await client.post('/v1/link', { uuid: UUID_A });
   assert.equal(linked.status, 200);
@@ -135,6 +138,7 @@ test('Telegram webhook secret is enforced and /start tokens bind only once', asy
     'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
   });
   assert.equal(rebound.status, 200);
+  assert.equal(sends.length, 1);
 
   await client.post('/v1/sync', {
     uuid: UUID_A,
@@ -142,9 +146,9 @@ test('Telegram webhook secret is enforced and /start tokens bind only once', asy
     events: [{ id: 'assistant-1', role: 'assistant', type: 'text', text: 'Ready from extension' }]
   });
 
-  assert.equal(sends.length, 1);
-  assert.equal(sends[0].body.chat_id, 123);
-  assert.equal(sends[0].body.text, 'Ready from extension');
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].body.chat_id, 123);
+  assert.equal(sends[1].body.text, 'Ready from extension');
   assert.doesNotMatch(JSON.stringify(logs.messages), /test-webhook-secret|test-token|123|999/);
 });
 
@@ -287,9 +291,9 @@ test('POST /v1/unlink marks existing assistant events delivered so a newly linke
     events: [{ id: 'assistant-before-unlink', role: 'assistant', type: 'text', text: 'do not replay me' }]
   });
   assert.equal(failedDelivery.status, 200);
-  assert.equal(sends.length, 1);
-  assert.equal(sends[0].body.chat_id, 321);
-  assert.equal(sends[0].body.text, 'do not replay me');
+  assert.equal(sends.length, 2);
+  assert.equal(sends[1].body.chat_id, 321);
+  assert.equal(sends[1].body.text, 'do not replay me');
 
   const unlink = await client.post('/v1/unlink', { uuid: UUID_A });
   assert.equal(unlink.status, 200);
@@ -302,7 +306,7 @@ test('POST /v1/unlink marks existing assistant events delivered so a newly linke
   const replayCheck = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
   assert.equal(replayCheck.status, 200);
   assert.equal(replayCheck.body.telegramLinked, true);
-  assert.equal(sends.length, 1);
+  assert.equal(sends.length, 3);
 
   const newAssistant = await client.post('/v1/sync', {
     uuid: UUID_A,
@@ -310,9 +314,9 @@ test('POST /v1/unlink marks existing assistant events delivered so a newly linke
     events: [{ id: 'assistant-after-relink', role: 'assistant', type: 'text', text: 'send this one' }]
   });
   assert.equal(newAssistant.status, 200);
-  assert.equal(sends.length, 2);
-  assert.equal(sends[1].body.chat_id, 654);
-  assert.equal(sends[1].body.text, 'send this one');
+  assert.equal(sends.length, 4);
+  assert.equal(sends[3].body.chat_id, 654);
+  assert.equal(sends[3].body.text, 'send this one');
 });
 
 test('Telegram /start refuses to bind one chat ID to two UUIDs without consuming the second token', async (t) => {
@@ -527,9 +531,9 @@ test('assistant events are delivered to Telegram via injected transport exactly 
     events: [{ id: 'assistant-once', role: 'assistant', type: 'text', text: 'sent once' }]
   });
   assert.equal(first.status, 200);
-  assert.equal(sends.length, 1);
-  assert.match(sends[0].url, /\/botfake-bot-token\/sendMessage$/);
-  assert.deepEqual(sends[0].body, {
+  assert.equal(sends.length, 2);
+  assert.match(sends[1].url, /\/botfake-bot-token\/sendMessage$/);
+  assert.deepEqual(sends[1].body, {
     chat_id: 789,
     text: 'sent once',
     disable_web_page_preview: true
@@ -542,7 +546,7 @@ test('assistant events are delivered to Telegram via injected transport exactly 
     events: [{ id: 'assistant-once', role: 'assistant', type: 'text', text: 'sent twice?' }]
   });
   assert.equal(duplicate.status, 200);
-  assert.equal(sends.length, 1);
+  assert.equal(sends.length, 2);
 });
 
 test('validation rejects invalid UUIDs, cursors, event sizes, traversal, and oversized JSON bodies', async (t) => {
@@ -622,10 +626,14 @@ test('state is stored in one JSON file per UUID with atomic-write cleanup', asyn
 
 async function startApp(t, overrides = {}) {
   const dataDir = overrides.dataDir ?? await tempDataDir(t);
+  const appOverrides = { ...overrides };
+  if (appOverrides.telegramBotToken && !Object.hasOwn(appOverrides, 'telegramTransport')) {
+    appOverrides.telegramTransport = async () => ({ ok: true, result: { message_id: 1 } });
+  }
   const app = createApp({
     dataDir,
     botUsername: 'EasyJobAppsBot',
-    ...overrides
+    ...appOverrides
   });
   return {
     client: makeClient(app.handler),

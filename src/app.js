@@ -15,6 +15,7 @@ import {
 } from './validation.js';
 
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
+const TELEGRAM_LINK_CONFIRMATION = 'Connected to Easy Job Apps. Messages are processed when the linked extension Chat is open.';
 
 export function createApp(options = {}) {
   const logger = safeLogger(options.logger ?? console);
@@ -216,32 +217,40 @@ export function createApp(options = {}) {
       return;
     }
 
-    await withTelegramBindingLock(async () => {
+    const bound = await withTelegramBindingLock(async () => {
       const uuid = await store.findUuidByToken(safeToken);
       if (!uuid) {
-        return;
+        return false;
       }
 
       const chatOwnerUuid = await store.findUuidByChatId(chatId);
       if (chatOwnerUuid && chatOwnerUuid !== uuid) {
-        return;
+        return false;
       }
 
-      await store.withUuid(uuid, async (state, save) => {
+      return store.withUuid(uuid, async (state, save) => {
         if (state.linkToken !== safeToken || state.tokenConsumedAt || state.telegramChatId !== null) {
-          return;
+          return false;
         }
 
         const currentChatOwnerUuid = await store.findUuidByChatId(chatId);
         if (currentChatOwnerUuid && currentChatOwnerUuid !== uuid) {
-          return;
+          return false;
         }
 
         state.telegramChatId = chatId;
         state.tokenConsumedAt = new Date().toISOString();
         await save();
+        return true;
       });
     });
+    if (bound) {
+      try {
+        await telegram.sendText(chatId, TELEGRAM_LINK_CONFIRMATION);
+      } catch {
+        logger.warn('telegram link confirmation failed', { code: 'telegram_confirmation_failed' });
+      }
+    }
   }
 
   async function appendTelegramText(update, message, chatId, text) {
