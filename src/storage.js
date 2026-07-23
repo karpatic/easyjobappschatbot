@@ -1,28 +1,28 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, open, readdir, readFile, realpath, rename, rm } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { isSafeEventId, validateUuid } from './validation.js';
 
 const STATE_VERSION = 1;
-const LOCK_DIR_NAME = '.locks';
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
-const DEFAULT_LOCK_STALE_MS = 30_000;
-const DEFAULT_LOCK_RETRY_MS = 20;
-const MIN_LOCK_HEARTBEAT_MS = 1_000;
+const DEFAULT_LOCK_RETRY_MS = 25;
 const LOCK_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,160}$/;
+const ABSTRACT_SOCKET_PREFIX = 'easyjobappschatbot:v1:';
+const LINUX_SOCKADDR_UN_PATH_BYTES = 108;
+const MIN_NODE_MAJOR_FOR_ABSTRACT_LOCKS = 22;
 
 export class FileStore {
-  constructor({ dataDir, lockTimeoutMs, lockStaleMs, lockRetryMs } = {}) {
+  constructor({ dataDir, lockTimeoutMs, lockRetryMs } = {}) {
     if (!dataDir || typeof dataDir !== 'string') {
       throw new Error('dataDir is required');
     }
     this.dataDir = resolve(dataDir);
     this.queues = new Map();
     this.lockTimeoutMs = positiveIntegerOrDefault(lockTimeoutMs, DEFAULT_LOCK_TIMEOUT_MS);
-    this.lockStaleMs = positiveIntegerOrDefault(lockStaleMs, DEFAULT_LOCK_STALE_MS);
     this.lockRetryMs = positiveIntegerOrDefault(lockRetryMs, DEFAULT_LOCK_RETRY_MS);
   }
 
@@ -30,7 +30,7 @@ export class FileStore {
 
   async withUuid(uuidInput, callback) {
     const uuid = validateUuid(uuidInput);
-    return this.withQueue(`uuid:${uuid}`, () => this.withFilesystemLock(`uuid-${uuid}`, async () => {
+    return this.withQueue(`uuid:${uuid}`, () => this.withSocketLock(`uuid-${uuid}`, async () => {
       const state = await this.readState(uuid);
       const save = async () => {
         await this.writeStateUnlocked(uuid, state);
@@ -41,7 +41,7 @@ export class FileStore {
 
   async withGlobalLock(name, callback) {
     const lockName = validateLockName(`global-${name}`);
-    return this.withQueue(lockName, () => this.withFilesystemLock(lockName, callback));
+    return this.withQueue(lockName, () => this.withSocketLock(lockName, callback));
   }
 
   withQueue(key, callback) {
@@ -128,7 +128,7 @@ export class FileStore {
 
   async writeState(uuidInput, state) {
     const uuid = validateUuid(uuidInput);
-    return this.withQueue(`uuid:${uuid}`, () => this.withFilesystemLock(`uuid-${uuid}`, () => this.writeStateUnlocked(uuid, state)));
+    return this.withQueue(`uuid:${uuid}`, () => this.withSocketLock(`uuid-${uuid}`, () => this.writeStateUnlocked(uuid, state)));
   }
 
   async writeStateUnlocked(uuidInput, state) {
@@ -160,22 +160,8 @@ export class FileStore {
     await access(this.dataDir, constants.R_OK | constants.W_OK);
   }
 
-  async ensureLockDir() {
-    await this.ensureDir();
-    await mkdir(this.lockRoot(), { recursive: true, mode: 0o700 });
-  }
-
-  lockRoot() {
-    return join(this.dataDir, LOCK_DIR_NAME);
-  }
-
-  lockDirFor(lockNameInput) {
-    const lockName = validateLockName(lockNameInput);
-    return join(this.lockRoot(), `${lockName}.lock`);
-  }
-
-  async withFilesystemLock(lockNameInput, callback) {
-    const release = await this.acquireFilesystemLock(lockNameInput);
+  async withSocketLock(lockNameInput, callback) {
+    const release = await this.acquireSocketLock(lockNameInput);
     try {
       return await callback();
     } finally {
@@ -183,98 +169,120 @@ export class FileStore {
     }
   }
 
-  async acquireFilesystemLock(lockNameInput) {
+  async acquireSocketLock(lockNameInput) {
     const lockName = validateLockName(lockNameInput);
-    await this.ensureLockDir();
-    const lockDir = this.lockDirFor(lockName);
-    const deadline = Date.now() + this.lockTimeoutMs;
+    const address = await this.socketAddressFor(lockName);
+    return acquireAbstractSocketLock(address, this.lockTimeoutMs, this.lockRetryMs);
+  }
 
-    for (;;) {
-      try {
-        await mkdir(lockDir, { mode: 0o700 });
-        return await this.activateFilesystemLock(lockDir);
-      } catch (error) {
-        if (error?.code !== 'EEXIST') {
-          throw error;
-        }
+  async socketAddressFor(lockNameInput) {
+    const lockName = validateLockName(lockNameInput);
+    await this.ensureDir();
+    const canonicalDataDir = await realpath(this.dataDir);
+    return makeAbstractSocketAddress(canonicalDataDir, lockName);
+  }
+}
+
+async function acquireAbstractSocketLock(address, timeoutMs, retryMs) {
+  assertAbstractSocketRuntimeSupported();
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const server = await listenOnAbstractSocket(address);
+      return makeSocketRelease(server);
+    } catch (error) {
+      if (error?.code !== 'EADDRINUSE') {
+        throw safeLockError('abstract socket lock acquisition failed', 'ELOCKFAILED');
       }
-
-      const recoveredStaleLock = await this.recoverStaleLock(lockDir);
-      if (recoveredStaleLock && Date.now() <= deadline) {
-        continue;
-      }
-
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) {
-        throw new Error('filesystem lock acquisition timed out');
+        throw safeLockError('abstract socket lock acquisition timed out', 'ELOCKTIMEDOUT');
       }
-      await delay(Math.min(this.lockRetryMs, remainingMs));
+      await delay(Math.min(retryMs, remainingMs));
     }
   }
+}
 
-  async activateFilesystemLock(lockDir) {
-    const ownerFile = join(lockDir, 'owner.json');
-    const acquiredAt = new Date().toISOString();
-    const makeOwner = () => `${JSON.stringify({
-      pid: process.pid,
-      acquiredAt,
-      heartbeatAt: new Date().toISOString()
-    }, null, 2)}\n`;
+function assertAbstractSocketRuntimeSupported() {
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (process.platform !== 'linux' || !Number.isSafeInteger(nodeMajor) || nodeMajor < MIN_NODE_MAJOR_FOR_ABSTRACT_LOCKS) {
+    throw safeLockError('abstract socket locks require Node.js 22 or newer on Linux', 'ELOCKUNSUPPORTED');
+  }
+}
 
-    try {
-      await writeFile(ownerFile, makeOwner(), { mode: 0o600 });
-    } catch (error) {
-      await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
-      throw error;
-    }
+function listenOnAbstractSocket(address) {
+  return new Promise((resolve, reject) => {
+    const server = createServer((socket) => {
+      socket.destroy();
+    });
+    let settled = false;
 
-    let released = false;
-    const heartbeatMs = Math.max(MIN_LOCK_HEARTBEAT_MS, Math.floor(this.lockStaleMs / 3));
-    const heartbeat = setInterval(() => {
-      writeFile(ownerFile, makeOwner(), { mode: 0o600 }).catch(() => undefined);
-    }, heartbeatMs);
-    heartbeat.unref?.();
-
-    return async () => {
-      if (released) {
+    const cleanup = () => {
+      server.off('error', onError);
+      server.off('listening', onListening);
+    };
+    const onError = (error) => {
+      if (settled) {
         return;
       }
-      released = true;
-      clearInterval(heartbeat);
-      await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+      settled = true;
+      cleanup();
+      reject(error);
     };
-  }
-
-  async recoverStaleLock(lockDir) {
-    let lockStat;
-    try {
-      lockStat = await stat(join(lockDir, 'owner.json'));
-    } catch (error) {
-      if (error?.code === 'ENOENT') {
-        try {
-          lockStat = await stat(lockDir);
-        } catch (statError) {
-          if (statError?.code === 'ENOENT') {
-            return true;
-          }
-          throw statError;
-        }
-      } else {
-        throw error;
+    const onListening = () => {
+      if (settled) {
+        return;
       }
-    }
+      settled = true;
+      cleanup();
+      resolve(server);
+    };
 
-    if (Date.now() - lockStat.mtimeMs < this.lockStaleMs) {
-      return false;
-    }
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(address);
+  });
+}
 
-    try {
-      await rm(lockDir, { recursive: true, force: true });
-      return true;
-    } catch (error) {
-      return error?.code === 'ENOENT';
+function makeSocketRelease(server) {
+  let releasePromise = null;
+  return () => {
+    releasePromise ??= closeSocketServer(server);
+    return releasePromise;
+  };
+}
+
+function closeSocketServer(server) {
+  return new Promise((resolve, reject) => {
+    if (!server.listening) {
+      resolve();
+      return;
     }
+    server.close((error) => {
+      if (!error || error.code === 'ERR_SERVER_NOT_RUNNING') {
+        resolve();
+        return;
+      }
+      reject(safeLockError('abstract socket lock release failed', 'ELOCKRELEASEFAILED'));
+    });
+  });
+}
+
+function makeAbstractSocketAddress(canonicalDataDir, lockName) {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([canonicalDataDir, lockName]))
+    .digest('hex');
+  const address = `\0${ABSTRACT_SOCKET_PREFIX}${digest}`;
+  if (Buffer.byteLength(address, 'utf8') >= LINUX_SOCKADDR_UN_PATH_BYTES) {
+    throw safeLockError('abstract socket lock address is too long', 'ELOCKNAMETOOLONG');
   }
+  return address;
+}
+
+function safeLockError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 export function newState(uuidInput) {
@@ -354,7 +362,7 @@ function positiveIntegerOrDefault(value, fallback) {
 
 function validateLockName(value) {
   if (typeof value !== 'string' || !LOCK_NAME_PATTERN.test(value)) {
-    throw new Error('invalid filesystem lock name');
+    throw new Error('invalid lock name');
   }
   return value;
 }

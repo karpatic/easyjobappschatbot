@@ -1,11 +1,10 @@
 import { FileStore } from '../src/storage.js';
 
-const [dataDir, uuid, eventId] = process.argv.slice(2);
+const [dataDir, uuid, eventId, lockTimeoutMsInput, lockRetryMsInput] = process.argv.slice(2);
 const store = new FileStore({
   dataDir,
-  lockTimeoutMs: 2_000,
-  lockStaleMs: 10_000,
-  lockRetryMs: 5
+  lockTimeoutMs: parsePositiveInteger(lockTimeoutMsInput, 2_000),
+  lockRetryMs: parsePositiveInteger(lockRetryMsInput, 5)
 });
 
 try {
@@ -42,4 +41,9 @@ function waitForRelease() {
       resolve();
     });
   });
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }

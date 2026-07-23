@@ -15,14 +15,20 @@ import {
 } from './validation.js';
 
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
+const DEFAULT_TELEGRAM_CONFIRMATION_TIMEOUT_MS = 5_000;
 const TELEGRAM_LINK_CONFIRMATION = 'Connected to Easy Job Apps. Messages are processed when the linked extension Chat is open.';
 
 export function createApp(options = {}) {
   const logger = safeLogger(options.logger ?? console);
   const store = options.store ?? new FileStore({ dataDir: options.dataDir });
+  const telegramConfirmationTimeoutMs = positiveIntegerOrDefault(
+    options.telegramConfirmationTimeoutMs,
+    DEFAULT_TELEGRAM_CONFIRMATION_TIMEOUT_MS
+  );
   const telegram = options.telegram ?? new TelegramClient({
     botToken: options.telegramBotToken,
-    transport: options.telegramTransport
+    transport: options.telegramTransport,
+    requestTimeoutMs: positiveIntegerOrDefault(options.telegramRequestTimeoutMs, telegramConfirmationTimeoutMs)
   });
   const botUsername = options.botUsername || 'EasyJobAppsBot';
   const bodyLimitBytes = options.bodyLimitBytes || DEFAULT_BODY_LIMIT_BYTES;
@@ -270,7 +276,9 @@ export function createApp(options = {}) {
       return false;
     }
     try {
-      const result = await telegram.sendText(chatId, TELEGRAM_LINK_CONFIRMATION);
+      const result = await telegram.sendText(chatId, TELEGRAM_LINK_CONFIRMATION, {
+        timeoutMs: telegramConfirmationTimeoutMs
+      });
       return result?.sent === true;
     } catch {
       logger.warn('telegram link confirmation failed', { code: 'telegram_confirmation_failed' });
@@ -514,4 +522,8 @@ function safeLogArgs(args) {
       return value;
     }));
   });
+}
+
+function positiveIntegerOrDefault(value, fallback) {
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }

@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
-import { fork } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { createApp } from '../src/app.js';
@@ -528,6 +526,81 @@ test('Telegram link confirmation is retryable when repeated /start follows a tra
   assert.equal(synced.body.telegramLinked, true);
 });
 
+test('Telegram link confirmation timeout waits for abort settlement before releasing the binding lock', async (t) => {
+  const sends = [];
+  let hangConfirmation = true;
+  let enteredTransport;
+  const transportEntered = new Promise((resolve) => {
+    enteredTransport = resolve;
+  });
+  let recordAbort;
+  const abortObserved = new Promise((resolve) => {
+    recordAbort = resolve;
+  });
+  let settleAbortedSend;
+  const abortedSendMaySettle = new Promise((resolve) => {
+    settleAbortedSend = resolve;
+  });
+  let abortedSendSettled = false;
+  const { client, close } = await startApp(t, {
+    telegramBotToken: 'test-bot-token',
+    telegramWebhookSecret: 'test-webhook-secret',
+    telegramConfirmationTimeoutMs: 50,
+    telegramTransport: async (request) => {
+      sends.push(request);
+      enteredTransport();
+      if (hangConfirmation) {
+        if (request.signal.aborted) {
+          recordAbort();
+        } else {
+          request.signal.addEventListener('abort', recordAbort, { once: true });
+        }
+        await abortObserved;
+        await abortedSendMaySettle;
+        abortedSendSettled = true;
+        throw new Error('transport aborted');
+      }
+      return { ok: true, result: { message_id: sends.length } };
+    },
+    logger: collectLogs().logger
+  });
+  t.after(close);
+
+  const link = await client.post('/v1/link', { uuid: UUID_A });
+  const token = startToken(link.body.telegramLink);
+  const webhook = client.post('/telegram/webhook', startUpdate(token, 456), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  });
+  await enteredTransport;
+
+  let unlinkResolved = false;
+  const unlink = client.post('/v1/unlink', { uuid: UUID_A }).then((response) => {
+    unlinkResolved = true;
+    return response;
+  });
+  await resolvesWithin(abortObserved, 250, 'confirmation abort');
+  await delay(75);
+  assert.equal(abortedSendSettled, false);
+  assert.equal(unlinkResolved, false);
+
+  settleAbortedSend();
+  assert.equal((await resolvesWithin(webhook, 250, 'aborted confirmation webhook')).status, 200);
+  const unlinkResponse = await resolvesWithin(unlink, 250, 'unlink behind hanging confirmation');
+  assert.equal(unlinkResponse.status, 200);
+  assert.equal(unlinkResponse.body.telegramLinked, false);
+  assert.equal(sends.length, 1);
+
+  hangConfirmation = false;
+  const retry = await resolvesWithin(client.post('/telegram/webhook', startUpdate(startToken(unlinkResponse.body.telegramLink), 789), {
+    'X-Telegram-Bot-Api-Secret-Token': 'test-webhook-secret'
+  }), 250, 'binding retry after confirmation timeout');
+  assert.equal(retry.status, 200);
+  assert.equal(sends.length, 2);
+
+  const synced = await client.post('/v1/sync', { uuid: UUID_A, after: 0, events: [] });
+  assert.equal(synced.body.telegramLinked, true);
+});
+
 test('Telegram /start refuses to bind one chat ID to two UUIDs without consuming the second token', async (t) => {
   const { client, close } = await startApp(t, {
     telegramBotToken: 'test-bot-token',
@@ -753,99 +826,6 @@ test('concurrent sync writes for the same UUID are serialized without losing eve
   assert.equal(synced.body.events.length, 20);
   assert.deepEqual(synced.body.events.map((event) => event.seq), Array.from({ length: 20 }, (_, index) => index + 1));
   assert.equal(new Set(synced.body.events.map((event) => event.id)).size, 20);
-});
-
-test('FileStore serializes per-UUID mutations across separate Node processes sharing a data directory', async (t) => {
-  const dataDir = await tempDataDir(t);
-  const workerPath = fileURLToPath(new URL('../test-fixtures/file_store_uuid_worker.mjs', import.meta.url));
-  const first = fork(workerPath, [dataDir, UUID_A, 'process-one'], {
-    stdio: ['ignore', 'ignore', 'pipe', 'ipc']
-  });
-  t.after(() => first.kill());
-  await waitForWorkerMessage(first, 'entered');
-
-  const second = fork(workerPath, [dataDir, UUID_A, 'process-two'], {
-    stdio: ['ignore', 'ignore', 'pipe', 'ipc']
-  });
-  t.after(() => second.kill());
-
-  let secondEntered = false;
-  const secondEnteredPromise = waitForWorkerMessage(second, 'entered').then((message) => {
-    secondEntered = true;
-    return message;
-  });
-  await delay(100);
-  assert.equal(secondEntered, false);
-
-  const firstSavedPromise = waitForWorkerMessage(first, 'saved');
-  first.send({ type: 'release' });
-  await firstSavedPromise;
-  await secondEnteredPromise;
-  const secondSavedPromise = waitForWorkerMessage(second, 'saved');
-  second.send({ type: 'release' });
-  await secondSavedPromise;
-  await Promise.all([waitForWorkerExit(first), waitForWorkerExit(second)]);
-
-  const state = JSON.parse(await readFile(join(dataDir, `${UUID_A}.json`), 'utf8'));
-  assert.deepEqual(state.events.map((event) => event.id), ['process-one', 'process-two']);
-  assert.deepEqual(state.events.map((event) => event.seq), [1, 2]);
-});
-
-test('FileStore locks have bounded waits, stale-lock recovery, and safe timeout errors', async (t) => {
-  const dataDir = await tempDataDir(t);
-  const staleLockDir = join(dataDir, '.locks', `uuid-${UUID_A}.lock`);
-  await mkdir(staleLockDir, { recursive: true, mode: 0o700 });
-  await writeFile(join(staleLockDir, 'owner.json'), JSON.stringify({
-    pid: 999999,
-    acquiredAt: '2000-01-01T00:00:00.000Z',
-    note: 'sensitive-token'
-  }));
-
-  const staleStore = new FileStore({
-    dataDir,
-    lockTimeoutMs: 250,
-    lockStaleMs: 1,
-    lockRetryMs: 5
-  });
-  await staleStore.withUuid(UUID_A, async (state, save) => {
-    state.events.push({
-      seq: state.nextSeq,
-      id: 'after-stale-lock',
-      origin: 'extension',
-      role: 'user',
-      type: 'text',
-      text: 'stored after stale recovery',
-      createdAt: new Date().toISOString()
-    });
-    state.nextSeq += 1;
-    await save();
-  });
-  await assert.rejects(stat(staleLockDir), { code: 'ENOENT' });
-
-  const activeLockDir = join(dataDir, '.locks', `uuid-${UUID_B}.lock`);
-  await mkdir(activeLockDir, { recursive: true, mode: 0o700 });
-  await writeFile(join(activeLockDir, 'owner.json'), JSON.stringify({
-    pid: process.pid,
-    acquiredAt: new Date().toISOString(),
-    note: 'sensitive-token'
-  }));
-
-  const blockedStore = new FileStore({
-    dataDir,
-    lockTimeoutMs: 50,
-    lockStaleMs: 10_000,
-    lockRetryMs: 5
-  });
-  await assert.rejects(
-    blockedStore.withUuid(UUID_B, async () => {
-      throw new Error('callback must not run while lock is held');
-    }),
-    (error) => {
-      assert.match(error.message, /lock/i);
-      assert.doesNotMatch(String(error.stack), /sensitive-token/);
-      return true;
-    }
-  );
 });
 
 test('reset clears events and preserves the UUID Telegram link', async (t) => {
@@ -1126,6 +1106,21 @@ function captureTelegram(sends) {
   };
 }
 
+async function resolvesWithin(promise, timeoutMs, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} did not resolve within ${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+    promise.catch?.(() => undefined);
+  }
+}
+
 function collectLogs() {
   const messages = [];
   const logger = {
@@ -1205,49 +1200,4 @@ class PairBarrier {
       waiter.resolve();
     }
   }
-}
-
-function waitForWorkerMessage(child, type) {
-  return new Promise((resolve, reject) => {
-    const stderr = [];
-    const onStderr = (chunk) => stderr.push(chunk.toString('utf8'));
-    const cleanup = () => {
-      child.off('message', onMessage);
-      child.off('exit', onExit);
-      child.stderr?.off('data', onStderr);
-    };
-    const onMessage = (message) => {
-      if (message?.type === 'error') {
-        cleanup();
-        reject(new Error(message.message));
-        return;
-      }
-      if (message?.type === type) {
-        cleanup();
-        resolve(message);
-      }
-    };
-    const onExit = (code, signal) => {
-      cleanup();
-      reject(new Error(`worker exited before ${type}: ${code ?? signal}; ${stderr.join('')}`));
-    };
-    child.on('message', onMessage);
-    child.once('exit', onExit);
-    child.stderr?.on('data', onStderr);
-  });
-}
-
-function waitForWorkerExit(child) {
-  if (child.exitCode !== null) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve, reject) => {
-    child.once('exit', (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`worker exited with ${code ?? signal}`));
-    });
-  });
 }

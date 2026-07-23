@@ -7,7 +7,7 @@
 - **HTTP only, no framework dependency:** the service uses Node's built-in `http` module and `node:test`.
 - **Durable per-UUID state:** each UUID v4 gets one JSON file at `${CHATBOT_DATA_DIR}/${uuid}.json`.
 - **Atomic persistence:** state writes go to a temporary file in the data directory, fsync the file, then rename over the UUID JSON file.
-- **Per-UUID serialization:** all mutations for a UUID run through a cross-process filesystem lock, plus an in-process promise queue, to avoid lost updates across relay instances sharing a data directory.
+- **Per-UUID serialization:** all mutations for a UUID run through a Node-held Linux abstract Unix-domain socket lock, plus an in-process promise queue, to avoid lost updates across relay instances sharing a data directory on one host.
 - **Private Telegram binding:** `/v1/link` returns a deep link for `EasyJobAppsBot` only when Telegram is fully configured; the Telegram chat ID is stored only in the UUID state file and is never returned by the public API.
 - **Safe relinking:** `/v1/unlink` detaches the current Telegram chat, keeps conversation history, invalidates the old deep-link token, creates a fresh one-time token, and prevents older unsent assistant messages from being replayed to a future chat.
 - **No-store responses:** all responses include `Cache-Control: no-store`.
@@ -183,7 +183,9 @@ Supported update behavior:
 - Do not log, return, or expose `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, Telegram chat IDs, or deep-link tokens outside the link URL returned to the caller.
 - Treat the UUID in extension API requests as a bearer value; send it only over HTTPS from trusted extension contexts.
 - `/v1/unlink` rotates the deep-link token on every call, including already-unlinked UUIDs. Use the latest returned `telegramLink`; older links must be considered revoked.
-- Telegram binding uses a cross-process global filesystem lock so two relay instances sharing a data directory cannot bind the same private Telegram chat to different UUIDs.
+- Telegram binding uses a cross-process global abstract socket lock so two relay instances sharing a data directory on the same host cannot bind the same private Telegram chat to different UUIDs.
+- Storage locks use Node 22's `node:net` server handles on Linux abstract Unix-domain socket addresses derived from SHA-256 of the canonical `CHATBOT_DATA_DIR` and validated lock name. They do not create filesystem sockets, `.locks` entries, lock inodes, helper processes, heartbeats, or stale-lease recovery state. Lock ownership is released when the server handle closes or when the owning relay process exits, including `SIGKILL`.
+- Lock coordination is single-host only. Relay processes on different hosts do not coordinate through shared storage, even if they point at the same network-mounted `CHATBOT_DATA_DIR`.
 - `/v1/reset` intentionally keeps its existing semantics: it clears conversation events while preserving the current Telegram link and binding.
 
 ## Configuration
@@ -210,13 +212,19 @@ CHATBOT_ENV_FILE=.env node src/index.js
 
 This repository intentionally has no runtime npm dependencies.
 
+Runtime prerequisites:
+
+- Node.js 22 or newer on Linux with abstract Unix-domain socket support.
+
 ## Deployment
 
-1. Run Node.js 18 or newer.
+1. Run Node.js 22 or newer on Linux. Keep all relay instances that share one `CHATBOT_DATA_DIR` on the same host.
 2. Create a persistent, private `CHATBOT_DATA_DIR`.
 3. Set `TELEGRAM_BOT_TOKEN` only in the runtime environment or an untracked env file.
 4. Set `TELEGRAM_WEBHOOK_SECRET` to a random value and configure Telegram's webhook with the same secret token.
 5. Put the service behind HTTPS before registering the Telegram webhook.
 6. Run `npm test` in CI before deployment.
+
+Migration note: deploy this as a stop-the-world migration from versions that used legacy `.locks/*.lock` directory leases or `.locks/*.flock` files. Stop every old relay process before starting this version because the lock formats do not coordinate while mixed versions run. After the old processes are stopped, leftover `.locks` artifacts are inert and may be removed out of band.
 
 The service handles `SIGINT` and `SIGTERM` by closing the HTTP server and storage hooks before exiting.
